@@ -1190,12 +1190,7 @@ async function reactAll(link, emojiText, onProgress) {
     return { ...r, channel: ch.name };
 }
 
-function parseEmojiList(input) {
-    return [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(String(input || ''))]
-        .map(x => x.segment).filter(g => /\p{Extended_Pictographic}/u.test(g));
-}
-
-async function setAutoChr(link, enabled, emojiText) {
+async function setAutoChr(link, enabled) {
     const parsed = parseChannel(link);
     if (!parsed) throw new Error('Invalid channel link. Use: https://whatsapp.com/channel/<code>');
     const first = activeSockets.values().next().value;
@@ -1206,9 +1201,7 @@ async function setAutoChr(link, enabled, emojiText) {
         saveAutoChrChannel();
         return { enabled: false, existed, channel: channel.name, ok: 0, fail: 0 };
     }
-    const emojis = parseEmojiList(emojiText);
-    const selectedEmojis = emojis.length ? emojis : String(CHANNEL_EMOJIS()).split(',').map(x => x.trim()).filter(Boolean);
-    autoChrChannels.set(channel.jid, { code: parsed.code, jid: channel.jid, name: channel.name, enabled: true, emojis: selectedEmojis.join(','), enabledAt: Date.now() });
+    autoChrChannels.set(channel.jid, { code: parsed.code, jid: channel.jid, name: channel.name, enabled: true, enabledAt: Date.now() });
     saveAutoChrChannel();
     // Subscribe to channel updates only. Do NOT follow the channel.
     const result = await eachBot(async (number, sock) => {
@@ -1218,7 +1211,7 @@ async function setAutoChr(link, enabled, emojiText) {
             throw new Error('This Baileys version does not support newsletter update subscriptions.');
         }
     });
-    return { ...result, enabled: true, channel: channel.name, emojis: selectedEmojis.join(',') };
+    return { ...result, enabled: true, channel: channel.name };
 }
 
 async function handleBaseCmd(socket, msg, cmd, args, { from, prefix, isBase }) {
@@ -1239,20 +1232,20 @@ async function handleBaseCmd(socket, msg, cmd, args, { from, prefix, isBase }) {
             if (firstArg === 'list') {
                 const channels = [...autoChrChannels.values()];
                 if (!channels.length) return reply('📭 No channels are enabled for AutoCHR.');
-                const lines = channels.map((ch, i) => `${i + 1}. ${ch.name}\n   ${ch.jid}\n   🎭 Emojis: ${(ch.emojis || CHANNEL_EMOJIS()).replace(/,/g, ' ')}\n   ✅ ON`);
+                const lines = channels.map((ch, i) => `${i + 1}. ${ch.name}\n   ${ch.jid}\n   ✅ ON`);
                 return reply(`📡 *AUTOCHR CHANNEL LIST*\n\n${lines.join('\n\n')}\n\nTotal: ${channels.length}`);
             }
             if (!args[0] || !args[1]) {
-                return reply(`📌 *AUTOCHR COMMANDS*\n${prefix}autochr <channel link> on <emojis>\n${prefix}autochr <channel link> off\n${prefix}autochr list\n\nExample: ${prefix}autochr https://whatsapp.com/channel/xxxx on ❤️🔥😍\nNo emojis = use default emojis.`);
+                return reply(`📌 *AUTOCHR COMMANDS*\n${prefix}autochr <channel link> on\n${prefix}autochr <channel link> off\n${prefix}autochr list`);
             }
             const mode = String(args[1]).toLowerCase();
             if (mode !== 'on' && mode !== 'off') {
-                return reply(`❌ Use: ${prefix}autochr <channel link> on <emojis>\n${prefix}autochr <channel link> off\n${prefix}autochr list`);
+                return reply(`❌ Use: ${prefix}autochr <channel link> on/off\nOr: ${prefix}autochr list`);
             }
             await reply(mode === 'on' ? '⏳ Enabling AutoCHR for this channel...' : '⏳ Disabling AutoCHR for this channel...');
-            const result = await setAutoChr(args[0], mode === 'on', args.slice(2).join(' '));
+            const result = await setAutoChr(args[0], mode === 'on');
             if (mode === 'on') {
-                return reply(`✅ *AUTOCHR ENABLED*\n📡 Channel: ${result.channel}\n🎭 Emojis: ${(result.emojis || CHANNEL_EMOJIS()).replace(/,/g, ' ')}\n🤖 Accounts ready: ${result.ok}\n❌ Failed: ${result.fail}\n\nNew posts will receive one random reaction from the selected emojis. No channel follow is performed.`);
+                return reply(`✅ *AUTOCHR ENABLED*\n📡 Channel: ${result.channel}\n🤖 Accounts subscribed for updates: ${result.ok}\n❌ Failed: ${result.fail}\n\nNew posts in this channel will receive automatic reactions.`);
             }
             return reply(`${result.existed ? '🛑' : 'ℹ️'} *AUTOCHR ${result.existed ? 'DISABLED' : 'ALREADY OFF'}*\n📡 Channel: ${result.channel}\n\nOther enabled channels are not affected.`);
         }
@@ -1270,7 +1263,7 @@ async function handleBaseCmd(socket, msg, cmd, args, { from, prefix, isBase }) {
             }
             if (!args[0] || !args[1]) return reply(`❌ Use: ${prefix}chreact on
 ${prefix}chreact off
-${prefix}chreact <post link> <emojis>\nEx: ${prefix}chreact https://whatsapp.com/channel/xxxx/123 ❤️🔥😍\n\nAny user of this bot can run this command. Reactions are sent by connected accounts that have CHREACT enabled.`);
+${prefix}chreact <post link> <emojis>\nEx: ${prefix}chreact https://whatsapp.com/channel/xxxx/123 ❤️🔥😍`);
 
             const total = [...activeSockets.keys()].filter(n => chreactConsent.has(clean(n))).length;
             let statusMsg;
@@ -1664,7 +1657,7 @@ async function reactToAutoChannelPost(socket, n, msg, seen) {
     if (ts && Date.now() / 1000 - ts > 3600) return;
     try {
         await delay(1200 + Math.floor(Math.random() * 3000));
-        await socket.newsletterReactMessage(target.jid, sid, pickEmoji(target.emojis || CHANNEL_EMOJIS(), '🩵'));
+        await socket.newsletterReactMessage(target.jid, sid, pickEmoji(CHANNEL_EMOJIS(), '🩵'));
         console.log(`📡 Auto channel reaction sent (${n}) -> ${target.name}`);
     } catch (e) {
         console.error(`Auto channel react error (${n}):`, e.message);
