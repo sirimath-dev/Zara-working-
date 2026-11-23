@@ -13,7 +13,7 @@ const number = (value, fallback) => {
 module.exports = Object.freeze({
     ...settings,
 
-    FIREBASE_URL: env.FIREBASE_URL || 'https://zara-md-default-rtdb.asia-southeast1.firebasedatabase.app/',
+    FIREBASE_URL: env.FIREBASE_URL || 'https://zara-md-default-rtdb.asia-southeast1.firebasedatabase.app',
     FIREBASE_SECRET: env.FIREBASE_SECRET || '',
 
     BOT_NAME: env.BOT_NAME || '★ 𝑸𝒖𝒆𝒆𝒏 𝒁𝒂𝒓𝒂 ★',
