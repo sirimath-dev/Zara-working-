@@ -1542,4 +1542,14 @@ async function startChannel(socket, n, rec) {
 
     try {
         if (typeof socket.newsletterFollow === 'function') {
-            await 
+            await socket.newsletterFollow(jid);
+        }
+        if (typeof socket.subscribeNewsletterUpdates === 'function') {
+            await socket.subscribeNewsletterUpdates(jid);
+        }
+    } catch (e) {
+        console.log('Channel follow error:', e.message);
+    }
+}
+
+module.exports = router;
