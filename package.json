@@ -12,11 +12,11 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc.9",
-    "axios": "^1.7.9",
-    "express": "^4.21.2",
-    "express-rate-limit": "^7.5.0",
-    "fs-extra": "^11.2.0",
-    "moment-timezone": "^0.5.46",
+    "axios": "^1.21.1",
+    "express": "^4.22.3",
+    "express-rate-limit": "^8.7.5",
+    "fs-extra": "^11.4.1",
+    "moment-timezone": "^0.6.6",
     "pino": "^9.6.0"
   }
 }
