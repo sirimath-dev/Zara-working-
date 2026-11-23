@@ -4,7 +4,7 @@ const path = require('path');
 const pino = require('pino');
 const moment = require('moment-timezone');
 const crypto = require('crypto');
-const axios = require('axios');
+const admin = require('firebase-admin');
 const rateLimit = require('express-rate-limit');
 
 const config = require('./config');
@@ -274,23 +274,41 @@ const dashLimiter = rl(120);
 const adminLimiter = rl(1500);
 
 /* ------------------------------------------------------------------ */
-/*  Firebase (REST) helpers                                            */
+/*  Firebase Admin SDK helpers                                         */
 /* ------------------------------------------------------------------ */
-const FB_BASE = String(config.FIREBASE_URL || '').replace(/\/+$/, '');
-const JSON_HEADERS = { 'Content-Type': 'application/json' };
+const FIREBASE_URL = String(config.FIREBASE_URL || '').replace(/\/+$/, '');
+const FIREBASE_PROJECT_ID = String(process.env.FIREBASE_PROJECT_ID || '').trim();
+const FIREBASE_CLIENT_EMAIL = String(process.env.FIREBASE_CLIENT_EMAIL || '').trim();
+const FIREBASE_PRIVATE_KEY = String(process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n').trim();
 
-function fbUrl(p, query = '') {
-    const params = [];
-    if (query) params.push(query);
-    if (config.FIREBASE_SECRET) params.push(`auth=${encodeURIComponent(config.FIREBASE_SECRET)}`);
-    return `${FB_BASE}/${p}.json${params.length ? '?' + params.join('&') : ''}`;
+if (!FIREBASE_URL || !FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
+    throw new Error('Firebase Admin SDK is not configured. Set FIREBASE_URL, FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY in Railway Variables.');
+}
+
+const firebaseApp = admin.apps.length ? admin.app() : admin.initializeApp({
+    credential: admin.credential.cert({
+        projectId: FIREBASE_PROJECT_ID,
+        clientEmail: FIREBASE_CLIENT_EMAIL,
+        privateKey: FIREBASE_PRIVATE_KEY
+    }),
+    databaseURL: FIREBASE_URL
+});
+const firebaseDb = firebaseApp.database();
+
+function fbRef(p) {
+    const cleanPath = String(p || '').replace(/^\/+|\/+$/g, '');
+    if (!cleanPath) return firebaseDb.ref('/');
+    return firebaseDb.ref(cleanPath);
 }
 
 const fb = {
-    get: async (p, query) => (await axios.get(fbUrl(p, query), { timeout: 20000 })).data,
-    put: (p, data) => axios.put(fbUrl(p), data, { headers: JSON_HEADERS, timeout: 60000, maxBodyLength: Infinity, maxContentLength: Infinity }),
-    patch: (p, data) => axios.patch(fbUrl(p), data, { headers: JSON_HEADERS, timeout: 30000 }),
-    del: (p) => axios.delete(fbUrl(p), { timeout: 20000 })
+    get: async (p) => {
+        const snapshot = await fbRef(p).get();
+        return snapshot.exists() ? snapshot.val() : null;
+    },
+    put: (p, data) => fbRef(p).set(data),
+    patch: (p, data) => fbRef(p).update(data),
+    del: (p) => fbRef(p).remove()
 };
 
 async function listNumbers() {
@@ -365,7 +383,7 @@ const FLUSH_CHUNK = 150;
 async function fbGetRetry(p, tries = 4) {
     let last;
     for (let i = 1; i <= tries; i++) {
-        try { return (await axios.get(fbUrl(p), { timeout: 45000 })).data; }
+        try { return await fb.get(p); }
         catch (e) { last = e; await delay(1000 * i); }
     }
     throw last;
@@ -513,7 +531,7 @@ async function useFirebaseAuthState(number) {
 /*  Per-user config                                                    */
 /* ------------------------------------------------------------------ */
 const BLOCKED_CONFIG_KEYS = new Set([
-    'FIREBASE_URL', 'FIREBASE_SECRET', 'ADMIN_KEY', 'OTP_EXPIRY', 'MAX_RETRIES',
+    'FIREBASE_URL', 'FIREBASE_SECRET', 'FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY', 'ADMIN_KEY', 'OTP_EXPIRY', 'MAX_RETRIES',
     'OWNER_NUMBER', 'GROUP_INVITE_LINK',
     '__proto__', 'constructor', 'prototype'
 ]);
@@ -1551,134 +1569,5 @@ async function startChannel(socket, n, rec) {
         console.log('Channel follow error:', e.message);
     }
 }
-
-
-/* ------------------------------------------------------------------ */
-/*  Pairing API                                                        */
-/* ------------------------------------------------------------------ */
-router.get('/', pairLimiter, async (req, res) => {
-    const number = clean(req.query.number);
-    if (!/^\d{8,15}$/.test(number)) {
-        return res.status(400).json({ error: 'Enter a valid WhatsApp number with country code.' });
-    }
-
-    if (activeSockets.has(number) && activeSockets.get(number)?.user) {
-        return res.status(409).json({ error: 'This WhatsApp number is already connected.' });
-    }
-    if (connecting.has(number)) {
-        return res.status(429).json({ error: 'A pairing request is already in progress. Please wait and try again.' });
-    }
-
-    connecting.add(number);
-    let authHandle;
-    let socket;
-
-    try {
-        const cfg = await loadUserConfig(number);
-        authHandle = await useFirebaseAuthState(number);
-        authHandles.set(number, authHandle);
-
-        let version;
-        try {
-            const latest = await fetchLatestBaileysVersion();
-            if (latest && Array.isArray(latest.version)) version = latest.version;
-        } catch (e) {
-            console.warn('Could not fetch the latest WhatsApp Web version:', e.message);
-        }
-
-        const socketOptions = {
-            auth: authHandle.state,
-            printQRInTerminal: false,
-            logger: pino({ level: 'silent' }),
-            browser: Browsers.ubuntu('Chrome'),
-            markOnlineOnConnect: false,
-            syncFullHistory: false
-        };
-        if (version) socketOptions.version = version;
-
-        socket = makeWASocket(socketOptions);
-        activeSockets.set(number, socket);
-        socketCreationTime.set(number, Date.now());
-
-        socket.ev.on('creds.update', async () => {
-            try { await authHandle.saveCreds(); }
-            catch (e) { console.error(`Could not save credentials for ${number}:`, e.message); }
-        });
-
-        const messageCache = new Map();
-        socket.ev.on('messages.upsert', async ({ messages, type }) => {
-            if (type !== 'notify' || !Array.isArray(messages)) return;
-            for (const msg of messages) {
-                try { await onMessage(socket, number, msg, messageCache); }
-                catch (e) { console.error(`Message handler error (${number}):`, e.message); }
-            }
-        });
-
-        socket.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect } = update || {};
-            if (connection === 'open') {
-                connecting.delete(number);
-                justPaired.add(number);
-                try {
-                    await addNumber(number);
-                    await startChannel(socket, number, { config: cfg });
-                    console.log(`WhatsApp connected: ${number}`);
-                } catch (e) {
-                    console.error(`Post-connect setup failed (${number}):`, e.message);
-                }
-            } else if (connection === 'close') {
-                connecting.delete(number);
-                activeSockets.delete(number);
-                socketCreationTime.delete(number);
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                console.warn(`WhatsApp connection closed (${number}); status: ${statusCode || 'unknown'}`);
-                if (authHandle) {
-                    try { await authHandle.flush(); } catch (e) {}
-                }
-            }
-        });
-
-        if (typeof socket.requestPairingCode !== 'function') {
-            throw new Error('This Baileys version does not support pairing codes. Check the installed @whiskeysockets/baileys version.');
-        }
-        const code = await socket.requestPairingCode(number);
-        if (!code) throw new Error('WhatsApp did not return a pairing code. Please try again.');
-        return res.status(200).json({ status: true, code: String(code).replace(/\s/g, '') });
-    } catch (error) {
-        connecting.delete(number);
-        if (socket) {
-            activeSockets.delete(number);
-            socketCreationTime.delete(number);
-            try { detach(socket); } catch (e) {}
-        }
-        if (authHandle) {
-            try { await authHandle.dispose(); } catch (e) {}
-            authHandles.delete(number);
-        }
-        console.error(`Pairing request failed (${number}):`, error);
-        const message = /firebase|database|unauthorized|permission/i.test(error.message)
-            ? 'Could not access Firebase session storage. Check FIREBASE_URL and Firebase database rules/secret.'
-            : (error.message || 'Could not generate the pairing code.');
-        return res.status(500).json({ error: message });
-    }
-});
-
-router.get('/health', (_req, res) => {
-    res.json({ status: 'ok', connected: activeSockets.size });
-});
-
-router.shutdown = async () => {
-    for (const [number, socket] of activeSockets) {
-        try { detach(socket); } catch (e) {}
-        const auth = authHandles.get(number);
-        if (auth) {
-            try { await auth.flush(); } catch (e) {}
-            try { await auth.dispose(); } catch (e) {}
-        }
-    }
-    activeSockets.clear();
-    authHandles.clear();
-    connecting.clear();
-};
 
 module.exports = router;
