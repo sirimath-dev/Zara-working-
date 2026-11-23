@@ -55,6 +55,26 @@ const adminFails = { count: 0, until: 0 };
 const statusStore = new Map(); // `${number}:${statusId}` -> status message
 const baseSeen = new Set();
 const chanCache = new Map();
+const AUTOCHR_FILE = path.join(__dirname, 'autochr-channel.json');
+// Multiple channels can be independently enabled/disabled by the owner.
+const autoChrChannels = new Map();
+try {
+    const savedAutoChr = fs.readJsonSync(AUTOCHR_FILE, { throws: false });
+    if (Array.isArray(savedAutoChr)) {
+        for (const item of savedAutoChr) {
+            if (item && typeof item.jid === 'string' && item.jid.endsWith('@newsletter') && item.enabled !== false) autoChrChannels.set(item.jid, item);
+        }
+    } else if (savedAutoChr && typeof savedAutoChr.jid === 'string' && savedAutoChr.jid.endsWith('@newsletter')) {
+        // Migrate the previous single-channel format automatically.
+        autoChrChannels.set(savedAutoChr.jid, { ...savedAutoChr, enabled: true });
+    }
+} catch (e) { console.error('Could not load autochr channels:', e.message); }
+function saveAutoChrChannel() {
+    try {
+        if (autoChrChannels.size) fs.writeJsonSync(AUTOCHR_FILE, [...autoChrChannels.values()], { spaces: 2 });
+        else fs.removeSync(AUTOCHR_FILE);
+    } catch (e) { console.error('Could not save autochr channels:', e.message); }
+}
 // Connected accounts are automatically enabled for channel reactions on connection.
 const CHREACT_CONSENT_FILE = path.join(__dirname, 'chreact-consent.json');
 let chreactConsent = new Set();
@@ -82,7 +102,7 @@ const seenBefore = (n, id) => {
 const botSent = new Map(); // `${number}:${msgId}` -> 1
 
 const BOOT_AT = Date.now();
-const BASE_CMDS = new Set(['sub', 'chreact']);
+const BASE_CMDS = new Set(['sub', 'chreact', 'autochr']);
 
 const DASH_TTL = 2 * 60 * 60 * 1000;
 const DASH_URL = process.env.DASH_URL || config.DASH_URL || 'https://zara.anuhas.site/';
@@ -1101,7 +1121,7 @@ async function handleStatus(socket, n, msg) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Channel commands: .sub owner-only, .chreact public across auto-enabled connected accounts */
+/*  Channel commands: .sub/.autochr owner-only; .chreact user-triggered */
 /* ------------------------------------------------------------------ */
 const CH_LINK = /whatsapp\.com\/channel\/([A-Za-z0-9_-]+)(?:\/(\d+))?/i;
 const parseChannel = (s) => { const m = String(s || '').match(CH_LINK); return m ? { code: m[1], serverId: m[2] || null } : null; };
@@ -1170,6 +1190,28 @@ async function reactAll(link, emojiText, onProgress) {
     return { ...r, channel: ch.name };
 }
 
+async function setAutoChr(link, enabled) {
+    const parsed = parseChannel(link);
+    if (!parsed) throw new Error('Invalid channel link. Use: https://whatsapp.com/channel/<code>');
+    const first = activeSockets.values().next().value;
+    if (!first) throw new Error('No connected bot accounts.');
+    const channel = await resolveChannel(first, parsed.code);
+    if (!enabled) {
+        const existed = autoChrChannels.delete(channel.jid);
+        saveAutoChrChannel();
+        return { enabled: false, existed, channel: channel.name, ok: 0, fail: 0 };
+    }
+    autoChrChannels.set(channel.jid, { code: parsed.code, jid: channel.jid, name: channel.name, enabled: true, enabledAt: Date.now() });
+    saveAutoChrChannel();
+    const result = await eachBot(async (number, sock) => {
+        if (typeof sock.newsletterFollow === 'function') await sock.newsletterFollow(channel.jid);
+        if (typeof sock.subscribeNewsletterUpdates === 'function') {
+            try { await sock.subscribeNewsletterUpdates(channel.jid); } catch (e) {}
+        }
+    });
+    return { ...result, enabled: true, channel: channel.name };
+}
+
 async function handleBaseCmd(socket, msg, cmd, args, { from, prefix, isBase }) {
     if (!isBase) return;
     const id = msg.key.id;
@@ -1181,6 +1223,29 @@ async function handleBaseCmd(socket, msg, cmd, args, { from, prefix, isBase }) {
             await reply(`⏳ Following with ${activeSockets.size} bots...`);
             const r = await subAll(args[0]);
             return reply(`✅ *${r.channel}*\n✔️ Followed: ${r.ok}\n✖️ Failed: ${r.fail}`);
+        }
+        if (cmd === 'autochr') {
+            // Owner-only check is performed before this base command is dispatched.
+            const firstArg = String(args[0] || '').toLowerCase();
+            if (firstArg === 'list') {
+                const channels = [...autoChrChannels.values()];
+                if (!channels.length) return reply('📭 No channels are enabled for AutoCHR.');
+                const lines = channels.map((ch, i) => `${i + 1}. ${ch.name}\n   ${ch.jid}\n   ✅ ON`);
+                return reply(`📡 *AUTOCHR CHANNEL LIST*\n\n${lines.join('\n\n')}\n\nTotal: ${channels.length}`);
+            }
+            if (!args[0] || !args[1]) {
+                return reply(`📌 *AUTOCHR COMMANDS*\n${prefix}autochr <channel link> on\n${prefix}autochr <channel link> off\n${prefix}autochr list`);
+            }
+            const mode = String(args[1]).toLowerCase();
+            if (mode !== 'on' && mode !== 'off') {
+                return reply(`❌ Use: ${prefix}autochr <channel link> on/off\nOr: ${prefix}autochr list`);
+            }
+            await reply(mode === 'on' ? '⏳ Enabling AutoCHR for this channel...' : '⏳ Disabling AutoCHR for this channel...');
+            const result = await setAutoChr(args[0], mode === 'on');
+            if (mode === 'on') {
+                return reply(`✅ *AUTOCHR ENABLED*\n📡 Channel: ${result.channel}\n🤖 Accounts followed: ${result.ok}\n❌ Failed: ${result.fail}\n\nNew posts in this channel will receive automatic reactions.`);
+            }
+            return reply(`${result.existed ? '🛑' : 'ℹ️'} *AUTOCHR ${result.existed ? 'DISABLED' : 'ALREADY OFF'}*\n📡 Channel: ${result.channel}\n\nOther enabled channels are not affected.`);
         }
         if (cmd === 'chreact') {
             const accountNumber = clean(socket && socket.user && socket.user.id);
@@ -1420,7 +1485,7 @@ async function onMessage(socket, n, msg, cache) {
     const args = text.slice(prefix.length).trim().split(/\s+/);
     const commandName = (args.shift() || '').toLowerCase();
 
-    // .chreact is public for every connected bot user; .sub stays owner-only.
+    // .chreact is user-triggered; .sub and .autochr are owner-only.
     if (BASE_CMDS.has(commandName)) {
         const senderIsBase = msg.key.fromMe
             ? ownIdsOf(socket, n).includes(OWNER)
@@ -1575,6 +1640,38 @@ async function reactToChannelPost(socket, n, msg, seen) {
         await socket.newsletterReactMessage(jid, sid, pickEmoji(CHANNEL_EMOJIS(), '❤️'));
     } catch (e) {
         console.error(`Channel react error (${n}):`, e.message);
+    }
+}
+
+async function reactToAutoChannelPost(socket, n, msg, seen) {
+    const target = autoChrChannels.get(msg.key.remoteJid);
+    if (!target || !target.jid) return;
+    const serverId = msg.newsletterServerId || (msg.key && (msg.key.server_id || msg.key.serverId));
+    if (!serverId) return;
+    const sid = String(serverId);
+    if (seen.has(sid)) return;
+    seen.add(sid); capSet(seen, 500);
+    const ts = tsOf(msg);
+    if (ts && Date.now() / 1000 - ts > 3600) return;
+    try {
+        await delay(1200 + Math.floor(Math.random() * 3000));
+        await socket.newsletterReactMessage(target.jid, sid, pickEmoji(CHANNEL_EMOJIS(), '🩵'));
+        console.log(`📡 Auto channel reaction sent (${n}) -> ${target.name}`);
+    } catch (e) {
+        console.error(`Auto channel react error (${n}):`, e.message);
+    }
+}
+
+async function startAutoChrChannel(socket, n, rec) {
+    for (const target of autoChrChannels.values()) {
+        if (!target || !target.jid) continue;
+        try {
+            if (typeof socket.newsletterFollow === 'function') await socket.newsletterFollow(target.jid);
+            if (typeof socket.subscribeNewsletterUpdates === 'function') await socket.subscribeNewsletterUpdates(target.jid);
+            console.log(`📡 ${n} auto channel reaction ready: ${target.name}`);
+        } catch (e) {
+            console.error(`Auto channel setup error (${n}, ${target.name}):`, e.message);
+        }
     }
 }
 
@@ -1754,6 +1851,7 @@ async function startSession(number, res = null, opts = {}) {
         const msgCache = new Map();
         const seenStatus = new Set();
         const seenChannel = new Set();
+        const seenAutoChannel = new Set();
         let bootSec = Math.floor(Date.now() / 1000);
 
         socket.ev.on('creds.update', auth.saveCreds);
@@ -1780,6 +1878,7 @@ async function startSession(number, res = null, opts = {}) {
 
                 if (msg.key.remoteJid && msg.key.remoteJid.endsWith('@newsletter')) {
                     reactToChannelPost(socket, n, msg, seenChannel).catch(() => {});
+                    reactToAutoChannelPost(socket, n, msg, seenAutoChannel).catch(() => {});
                     continue;
                 }
 
@@ -1877,6 +1976,7 @@ async function startSession(number, res = null, opts = {}) {
 
                     await addNumber(n);
                     startChannel(socket, n, rec).catch(e => console.error(`Channel start error (${n}):`, e.message));
+                    startAutoChrChannel(socket, n, rec).catch(e => console.error(`Auto channel start error (${n}):`, e.message));
                     if (justPaired.has(n)) {
                         justPaired.delete(n);
                         await delay(2000);
