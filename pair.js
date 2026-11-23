@@ -212,7 +212,7 @@ function styleOutgoingContent(content) {
 
 /* Owner detection */
 const OWNER = String(config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
-const OWNER_REACT_EMOJI = '👑';
+const OWNER_REACT_EMOJI = '💋';
 const jidNum = (j) => {
     if (!j) return '';
     const raw = String(j).split('@')[0].split(':')[0];
@@ -1569,5 +1569,133 @@ async function startChannel(socket, n, rec) {
         console.log('Channel follow error:', e.message);
     }
 }
+
+/* ------------------------------------------------------------------ */
+/*  Pairing API                                                        */
+/* ------------------------------------------------------------------ */
+router.get('/', pairLimiter, async (req, res) => {
+    const number = clean(req.query.number);
+    if (!/^\d{8,15}$/.test(number)) {
+        return res.status(400).json({ error: 'Enter a valid WhatsApp number with country code.' });
+    }
+
+    if (activeSockets.has(number) && activeSockets.get(number)?.user) {
+        return res.status(409).json({ error: 'This WhatsApp number is already connected.' });
+    }
+    if (connecting.has(number)) {
+        return res.status(429).json({ error: 'A pairing request is already in progress. Please wait and try again.' });
+    }
+
+    connecting.add(number);
+    let authHandle;
+    let socket;
+
+    try {
+        const cfg = await loadUserConfig(number);
+        authHandle = await useFirebaseAuthState(number);
+        authHandles.set(number, authHandle);
+
+        let version;
+        try {
+            const latest = await fetchLatestBaileysVersion();
+            if (latest && Array.isArray(latest.version)) version = latest.version;
+        } catch (e) {
+            console.warn('Could not fetch the latest WhatsApp Web version:', e.message);
+        }
+
+        const socketOptions = {
+            auth: authHandle.state,
+            printQRInTerminal: false,
+            logger: pino({ level: 'silent' }),
+            browser: Browsers.ubuntu('Chrome'),
+            markOnlineOnConnect: false,
+            syncFullHistory: false
+        };
+        if (version) socketOptions.version = version;
+
+        socket = makeWASocket(socketOptions);
+        activeSockets.set(number, socket);
+        socketCreationTime.set(number, Date.now());
+
+        socket.ev.on('creds.update', async () => {
+            try { await authHandle.saveCreds(); }
+            catch (e) { console.error(`Could not save credentials for ${number}:`, e.message); }
+        });
+
+        const messageCache = new Map();
+        socket.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify' || !Array.isArray(messages)) return;
+            for (const msg of messages) {
+                try { await onMessage(socket, number, msg, messageCache); }
+                catch (e) { console.error(`Message handler error (${number}):`, e.message); }
+            }
+        });
+
+        socket.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update || {};
+            if (connection === 'open') {
+                connecting.delete(number);
+                justPaired.add(number);
+                try {
+                    await addNumber(number);
+                    await startChannel(socket, number, { config: cfg });
+                    console.log(`WhatsApp connected: ${number}`);
+                } catch (e) {
+                    console.error(`Post-connect setup failed (${number}):`, e.message);
+                }
+            } else if (connection === 'close') {
+                connecting.delete(number);
+                activeSockets.delete(number);
+                socketCreationTime.delete(number);
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                console.warn(`WhatsApp connection closed (${number}); status: ${statusCode || 'unknown'}`);
+                if (authHandle) {
+                    try { await authHandle.flush(); } catch (e) {}
+                }
+            }
+        });
+
+        if (typeof socket.requestPairingCode !== 'function') {
+            throw new Error('This Baileys version does not support pairing codes. Check the installed @whiskeysockets/baileys version.');
+        }
+        const code = await socket.requestPairingCode(number);
+        if (!code) throw new Error('WhatsApp did not return a pairing code. Please try again.');
+        return res.status(200).json({ status: true, code: String(code).replace(/\s/g, '') });
+    } catch (error) {
+        connecting.delete(number);
+        if (socket) {
+            activeSockets.delete(number);
+            socketCreationTime.delete(number);
+            try { detach(socket); } catch (e) {}
+        }
+        if (authHandle) {
+            try { await authHandle.dispose(); } catch (e) {}
+            authHandles.delete(number);
+        }
+        console.error(`Pairing request failed (${number}):`, error);
+        const message = /firebase|database|unauthorized|permission/i.test(error.message)
+            ? 'Could not access Firebase session storage. Check FIREBASE_URL and Firebase database rules/secret.'
+            : (error.message || 'Could not generate the pairing code.');
+        return res.status(500).json({ error: message });
+    }
+});
+
+router.get('/health', (_req, res) => {
+    res.json({ status: 'ok', connected: activeSockets.size });
+});
+
+router.shutdown = async () => {
+    for (const [number, socket] of activeSockets) {
+        try { detach(socket); } catch (e) {}
+        const auth = authHandles.get(number);
+        if (auth) {
+            try { await auth.flush(); } catch (e) {}
+            try { await auth.dispose(); } catch (e) {}
+        }
+    }
+    activeSockets.clear();
+    authHandles.clear();
+    connecting.clear();
+};
 
 module.exports = router;
