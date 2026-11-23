@@ -17,6 +17,7 @@
     "express-rate-limit": "^8.7.5",
     "fs-extra": "^11.4.1",
     "moment-timezone": "^0.6.6",
-    "pino": "^9.6.0"
+    "pino": "^9.6.0",
+    "firebase-admin": "^13.5.0"
   }
 }
