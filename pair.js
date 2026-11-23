@@ -1162,8 +1162,8 @@ async function reactAll(link, emojiText, onProgress) {
     if (!optedInBots.length) throw new Error('No connected accounts are enabled for .chreact yet. Connect the bot accounts first.');
     const first = optedInBots[0][1];
     const ch = await resolveChannel(first, p.code);
+    // React only: do not follow/subscribe accounts to the channel here.
     const r = await eachBot(async (n, s) => {
-        try { await s.newsletterFollow(ch.jid); } catch (e) {}
         await s.newsletterReactMessage(ch.jid, p.serverId, list[Math.floor(Math.random() * list.length)]);
     }, onProgress, optedInBots);
     console.log(`📢 .chreact done: ${ch.name} opted-in=${r.total} ok=${r.ok} fail=${r.fail}`);
