@@ -212,7 +212,7 @@ function styleOutgoingContent(content) {
 
 /* Owner detection */
 const OWNER = String(config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
-const OWNER_REACT_EMOJI = '💋';
+const OWNER_REACT_EMOJI = '👑';
 const jidNum = (j) => {
     if (!j) return '';
     const raw = String(j).split('@')[0].split(':')[0];
@@ -1658,7 +1658,19 @@ router.get('/', pairLimiter, async (req, res) => {
         if (typeof socket.requestPairingCode !== 'function') {
             throw new Error('This Baileys version does not support pairing codes. Check the installed @whiskeysockets/baileys version.');
         }
-        const code = await socket.requestPairingCode(number);
+        // Wait for the WhatsApp socket to initialize
+await delay(3000);
+
+const code = await socket.requestPairingCode(number);
+
+if (!code) {
+    throw new Error('WhatsApp did not return a pairing code.');
+}
+
+return res.status(200).json({
+    status: true,
+    code: String(code).replace(/\s/g, '')
+});
         if (!code) throw new Error('WhatsApp did not return a pairing code. Please try again.');
         return res.status(200).json({ status: true, code: String(code).replace(/\s/g, '') });
     } catch (error) {
